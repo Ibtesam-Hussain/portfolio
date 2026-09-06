@@ -1,0 +1,148 @@
+---
+title: "From Naive RAG to Hybrid RAG: What I Actually Built and Why"
+date: "12-07-2026"
+excerpt: "A honest walkthrough of building a production-grade Hybrid RAG system over academic papers — the architecture decisions, the bugs that humbled me, and the eval numbers that proved it worked."
+---
+
+# From Naive RAG to Hybrid RAG: What I Actually Built and Why
+
+Most RAG tutorials show you a chatbot that "chats with your PDF" in 30 lines of LangChain. That's fine for a demo. It falls apart the moment you ask a technical question that requires understanding *what was actually written* versus *what the model thinks was written*.
+
+This is a walkthrough of the Hybrid RAG system I built for my FYP Research Assistant — a tool for querying 8 academic papers on monocular depth estimation. Not a tutorial. A post-mortem.
+
+---
+
+## Why Naive RAG Wasn't Enough
+
+The obvious starting point is dense retrieval: embed your documents, embed the query, find the closest vectors. It works reasonably well for general questions. It breaks on technical corpora in two specific ways.
+
+**Problem 1 — Exact terminology misses.** When someone asks about "MAGSAC" or "SGBM" or "WLS filter," a dense embedding model groups these near semantically similar concepts — which is good for understanding but bad for lookup. The embedding for "MAGSAC" sits near "robust estimation" and "geometric fitting," not necessarily near the specific chunk that defines the MAGSAC threshold parameter.
+
+**Problem 2 — The reverse is also true.** BM25 (keyword search) catches exact terms perfectly but completely misses paraphrase. A question about "why single-image depth estimation is fundamentally ambiguous" won't match a chunk that says "monocular depth estimation is an ill-posed problem" because the vocabulary doesn't overlap.
+
+The insight: these two failure modes are *complementary*. Dense search fails where sparse succeeds, and vice versa. Run both. Merge the results intelligently.
+
+---
+
+## The Architecture
+
+```text
+Query
+├── BGE-base embedder → ChromaDB (top-15 dense candidates)
+└── BM25 tokenizer → BM25 index (top-15 sparse candidates)
+↓
+Reciprocal Rank Fusion
+↓
+Cross-Encoder Rerank (top-5)
+↓
+Citation-enforcing prompt → LLM → Grounded answer
+```
+
+
+Three retrieval stages, each with a specific job:
+
+**Stage 1 — Dual retrieval.** Dense and sparse run independently on the same query. `top_k=15` from each — intentionally wider than the final answer set of 5. Fusion needs material to work with. If you only retrieve 5 from each, you're asking fusion to reorder a pre-narrowed list.
+
+**Stage 2 — Reciprocal Rank Fusion.** RRF merges the two ranked lists using only position, not raw scores. This matters because dense returns L2 distance (lower = better, ~0.3-1.5 range) and BM25 returns TF-IDF scores (higher = better, unbounded). You cannot average these — the scales are incompatible. RRF's formula `1 / (k + rank)` is scale-invariant by design. A chunk appearing at rank 2 in both lists scores higher than one at rank 1 in only one — consensus is rewarded.
+
+**Stage 3 — Cross-encoder reranking.** RRF gives a reasonable merged order cheaply. The cross-encoder reads query and chunk *together* in one forward pass, scoring their actual relevance rather than measuring pre-computed vector distance. More accurate, but can't be precomputed — which is why it runs only on the small fused shortlist, not the full corpus.
+
+---
+
+## The Bug That Took Longest to Find
+
+> "All chunks returned page 1."
+
+I spent longer on this than I'd like to admit. The fix was one line. The diagnosis took debugging through three layers of abstraction.
+
+The original chunking approach merged all pages into one text stream, tracked character positions for each page, then used `str.find()` to map each chunk back to its source page. Clean in theory. Broken in practice.
+
+`MarkdownHeaderTextSplitter` rewrites whitespace when it reconstructs `page_content`. The double newlines that existed in the original stream become `"  \n"` in the chunk. So `str.find(chunk_text[:100])` returned `-1` on every single chunk — the text had been transformed enough that it no longer matched the original stream verbatim. The default `assigned_page = 1` silently won every time.
+
+The fix: chunk page-by-page instead of merging everything first. Since you're always inside a specific page's scope when generating chunks, `page.page_num` is correct by construction. No searching required.
+
+```python
+# Wrong — merges everything, then tries to reverse-engineer page numbers
+for page in doc.pages:
+    full_stream += page.markdown_text + "\n\n"
+
+# Right — never leaves the page's scope
+for page in doc.pages:
+    sections = splitter.split_text(page.markdown_text)
+    chunks   = text_splitter.split_documents(sections)
+    for chunk in chunks:
+        chunk.metadata["page_num"] = page.page_num  # always correct
+```
+
+This is also a lesson about silent defaults. The bug produced no error, no warning, no obvious sign anything was wrong. Just subtly incorrect metadata on every chunk — the kind of thing you only catch when you look at your eval results and wonder why citations always point to page 1.
+
+---
+
+## What the Eval Actually Showed
+
+I wrote a 28-question testset by hand — a mix of factual questions, methodological questions, cross-paper comparisons, and deliberately unanswerable questions (things not in the corpus at all).
+
+| Config | Recall@5 | MRR |
+|---|---|---|
+| Dense only | 0.60 | 0.496 |
+| Sparse only | 0.40 | 0.296 |
+| **Hybrid** | **0.76** | **0.555** |
+
+Hybrid beats dense-only by 16 points on Recall@5 — which translates directly to answers being grounded in the right chunk rather than a plausible-sounding adjacent one.
+
+For generation quality, I ran RAGAS on the hybrid config:
+
+| Metric | Score |
+|---|---|
+| Faithfulness | 0.82 |
+| Answer Relevancy | 0.89 |
+
+The 3 answers that scored below 0.5 faithfulness all correspond to the same 7 retrieval failures. When the right chunk isn't in the top-5, one of two things happens: the model correctly says "not found in context," or it answers from training knowledge — which RAGAS correctly penalizes. Faithfulness isn't independent of retrieval quality. A retrieval failure at stage 1 becomes a faithfulness failure at stage 4.
+
+---
+
+## The Retrieval Failures Worth Documenting
+
+I didn't hide the failures. 7 of 25 answerable questions still failed after all optimizations. They cluster into three patterns:
+
+**Introductory content.** Questions about a paper's motivation ("why did the authors pursue unsupervised depth estimation?") hit the introduction section, which uses generic vocabulary that competes equally with every other paper's introduction. The embedding model can't distinguish "the motivation of *this specific paper*" from general motivation language.
+
+**Abbreviation mismatch.** "What network does martins2018 use?" doesn't retrieve the chunk containing "Fully Convolutional Network based on VGG" because the query uses no tokens that appear in the chunk. Neither dense nor sparse handles this well without query expansion.
+
+**Single-domain corpus confusion.** All 8 papers discuss monocular depth estimation. When you ask a paper-specific question, you're competing against topically identical content from 7 other papers. Metadata filtering by source file would solve this — it's the obvious next improvement.
+
+Documenting these isn't admitting failure. It's demonstrating that I understand where my system's boundaries are — which is more useful than claiming it works perfectly.
+
+---
+
+## On "Load Once, Reuse"
+
+The single biggest practical optimization isn't in the retrieval logic. It's not calling a model-loading function inside a loop.
+
+BGE embedder: ~440MB. Cross-encoder: ~90MB. Loading both from disk on every query would add 30-60 seconds of dead time before any retrieval happens. The fix is to load them once at startup and reuse the same objects across all queries.
+
+In Streamlit, `@st.cache_resource` handles this — the decorated function runs once per session, and subsequent calls return the cached object instantly. Without it, every user interaction triggers a script rerun, which without caching means reloading both models from scratch on every button click.
+
+```python
+@st.cache_resource(show_spinner=False)
+def load_pipeline():
+    from src.pipeline import RAGPipeline
+    return RAGPipeline()  # loads once, cached forever in this session
+```
+
+This is also why ingestion and retrieval are separated. Parsing, chunking, and embedding 611 chunks is a batch job that runs once. The query path reads from pre-built indexes — it never touches the ingestion code. Paying ingestion cost per query would be absurd, but it's the default if you don't explicitly separate the two concerns.
+
+---
+
+## Source Code
+
+The full implementation — ingestion pipeline, dual indexing, RRF fusion, cross-encoder reranking, RAGAS evaluation harness, and Streamlit UI — is on GitHub:
+
+**[github.com/Ibtesam-Hussain/FYP-research-assistant](https://github.com/Ibtesam-Hussain/FYP-research-assistant)**
+
+The eval results, testset, and cached RAGAS scores are committed alongside the code so the numbers are reproducible without re-running expensive LLM calls.
+
+---
+
+*Published July 12, 2026*
+

@@ -1,0 +1,168 @@
+---
+title: "How We Built a Wound Depth Estimator Using One Photo and an AI-Generated Camera"
+date: "01-05-2026"
+excerpt: "What started as a general computer vision experiment became a clinical wound assessment system. Here is the full story — the idea, the architecture, the failures, and what actually worked."
+---
+
+# How We Built a Wound Depth Estimator Using One Photo and an AI-Generated Camera
+
+Measuring the depth of a wound sounds simple. It is not.
+
+A clinician today places a physical probe, ruler, or wound tracing acetate against broken and often infected skin to get a depth reading. The result varies depending on who is measuring, how they hold the probe, and whether the patient flinches. Advanced systems — structured light scanners, stereophotogrammetry rigs, laser triangulation — solve the consistency problem but cost thousands of dollars and live in specialist facilities, not at a patient's bedside.
+
+We wanted to solve this with a single smartphone photograph. No probes. No rigs. No contact.
+
+## The Core Problem With Monocular Depth
+
+A photograph is a 2D projection of a 3D world. The moment light hits the sensor, depth information is gone. Monocular depth estimation models — networks trained to hallucinate depth from a single image — recover some of that information from learned visual cues: shading, texture gradients, relative size, perspective. They are genuinely impressive at global scene understanding.
+
+But they are bad at fine detail.
+
+A wound cavity is a small, localized depression in soft tissue. The depth difference between the cavity floor and the surrounding skin might be a few millimeters. A pretrained monocular model sees a wound and understands there is a wound here — but it smooths over the micro-geometry that actually matters clinically. The edges are blurry. The cavity shape is approximate.
+
+This is the gap we set out to fill.
+
+## The Idea: Generate the Second Camera
+
+Stereo depth estimation does not have this problem. When you have two cameras separated by a known baseline, you measure depth geometrically — the same way your two eyes judge distance. The math is precise. The fine detail survives.
+
+The problem with stereo is the hardware. Two calibrated cameras. Known intrinsics. Known extrinsics. A physical baseline. None of that exists when a nurse takes a photo on a smartphone.
+
+Our question was: what if we synthesized the second camera?
+
+We give Gemini AI the original wound photograph and ask it to generate what the scene would look like from a viewpoint shifted 7cm to the right — as if a second camera were sitting beside the first on a stereo rig. One real image. One AI-generated image. A pseudo-stereo pair.
+
+The same photograph a nurse already takes for documentation becomes the input to a stereo depth pipeline.
+
+This is the architectural novelty. To our knowledge, no published work has combined generative AI viewpoint synthesis with classical stereo geometry and a pretrained monocular depth model specifically for clinical wound assessment. We designed this from scratch.
+
+## The Architecture
+
+The system runs two parallel pipelines on every wound pair and fuses their outputs.
+
+### Pipeline 1 — Stereo Geometry
+
+This pipeline extracts the micro-detail that monocular models miss.
+
+CLAHE preprocessing comes first. Wound images have compressed local contrast — specular highlights over dark cavities — and SIFT will find almost nothing without boosting local intensity variation first.
+
+Feature matching uses SIFT with a tight Lowe ratio of 0.70, followed by MAGSAC for fundamental matrix estimation. MAGSAC is more robust than standard RANSAC on biological tissue where matches can be noisy and the AI-synthesized view introduces subtle artifacts.
+
+Uncalibrated rectification uses stereoRectifyUncalibrated — no camera intrinsics needed. The fundamental matrix encodes all the epipolar geometry required to align the two views for stereo matching.
+
+Disparity estimation uses SGBM with a block size of 3 — small enough to capture fine wound structure. The disparity search range is auto-probed from the actual pixel shifts of matched inliers. This is why we were getting all-black disparity maps early on: we were guessing numDisparities instead of measuring it.
+
+WLS filtering sharpens the disparity map at wound edges using the original image intensity as guidance — so depth boundaries align with real tissue boundaries rather than bleeding across them.
+
+The pipeline outputs a depth map, a confidence map built from inverted reprojection error, and a valid mask.
+
+### Pipeline 2 — DA3 Giant
+
+DA3 Giant (depth-anything/da3nested-giant-large) handles what stereo geometry cannot: global scene structure, regions with no texture for SIFT to match on, and the 25–45% of each image that falls into the stereo dead zone created by rectification warping.
+
+It runs on the original image alone. No AI viewpoint needed. Output is normalized inverse depth, convention-corrected so wound cavity is low and surrounding skin is high — matching the stereo pipeline's convention.
+
+### Fusion — Laplacian Pyramid
+
+This is where the architecture comes together.
+
+A Laplacian pyramid decomposes both depth maps into frequency bands — fine detail at the top, global structure at the bottom. We blend each band separately, assigning each pipeline to what it does best:
+
+| Level | P1 weight | DA3 weight |
+| --- | ---: | ---: |
+| 0 (finest) | 1.0 | 0.1 |
+| 1 | 0.82 | 0.27 |
+| 2 | 0.55 | 0.63 |
+| 3 | 0.28 | 0.82 |
+| 4 (coarsest) | 0.1 | 0.9 |
+
+The stereo pipeline adds wound edge micro-detail at fine frequencies. DA3 provides global scene structure at coarse frequencies. Neither pipeline's weaknesses dominate the output.
+
+One important fix: 15-pixel mask erosion before building the blend weights. The homographic warp used in rectification creates a hard geometric boundary at the edge of the valid stereo region — a straight line artifact that looks like a real depth edge but is not. Eroding the valid mask inward by 15 pixels removes this boundary before it can enter the pyramid. DA3 fills the removed region seamlessly.
+
+## The Quality Gate We Discovered by Accident
+
+Early in the project we noticed that some AI-generated viewpoints produced excellent stereo results and others produced garbage. We needed a way to predict quality before running the full pipeline.
+
+We tried texture analysis. We tried feature match count. Neither was reliable.
+
+The metric that worked was SSIM — Structural Similarity Index between the original wound image and the Gemini-generated view. Higher SSIM means Gemini preserved geometric structure faithfully. Lower SSIM means it hallucinated too much.
+
+The correlation was significant across 51 pairs:
+
+| SSIM range | Mean reprojection error |
+| --- | --- |
+| > 0.80 | ~7 gray levels (calibrated range) |
+| 0.55–0.80 | ~15 gray levels (acceptable) |
+| < 0.40 | > 30 gray levels (unreliable) |
+
+SSIM became our automated pre-flight check. Before running SGBM, we compute SSIM. Below threshold — defer entirely to DA3. Above threshold — run the full hybrid pipeline.
+
+## What Actually Failed
+
+**Black disparity maps.** For weeks. The cause was `numDisparities` — we were setting it to a fixed value instead of probing the actual pixel shift range between views. Once we auto-detected the range from matched inlier coordinates, SGBM produced real disparity on the first run.
+
+**Depth convention backwards.** DA3 outputs inverse depth — higher values mean closer to camera. After normalization, wound cavities appeared warm and surrounding skin appeared cool. Clinically wrong and confusing. One line fix: `depth_norm = 1.0 - depth_norm`. But catching it cost time because it looks plausible until you think about it carefully.
+
+**The rectification artifact.** The WLS filter sharpens depth at boundaries — including the hard geometric boundary created by the homographic warp. Early fusion results showed a visible diagonal line across every output. The pyramid alone did not remove it. Mask erosion did.
+
+**RAFT stereo was worse than SGBM.** We tested RAFT-Stereo expecting it to outperform the classical pipeline. It gave 40.90 gray levels reprojection error against SGBM's 25.33 on the same pair. RAFT confidently tracks AI hallucination artifacts as if they were real geometry. Classical SGBM was more honest about where it had no reliable signal.
+
+## Results
+
+Evaluated on 51 wound image pairs — original clinical photographs paired with Gemini-synthesized viewpoints.
+
+| Metric | Value |
+| --- | ---: |
+| Calibrated stereo range (<12 gray levels) | 43.1% |
+| Acceptable range (12–25 gray levels) | 27.5% |
+| Best pair reprojection error | 2.31 gray levels |
+| Mean reprojection error | 17.8 gray levels |
+| Mean runtime per pair (GPU) | 3.8 seconds |
+
+43.1% of pairs matched the accuracy of a physically calibrated two-camera stereo rig — without knowing anything about camera intrinsics, baselines, or lens parameters.
+
+The best pair (Buraimoh, Linda) achieved 2.31 gray levels — competitive with precision calibrated systems.
+
+## What Reprojection Error Actually Means
+
+We had no ground truth depth maps for training or evaluation. Reprojection error is a self-supervised quality metric: use the computed disparity to warp one view onto the other, then measure how different the result is from the actual image.
+
+If depth is accurate, the warp should reconstruct the image well. If depth is wrong, the warp produces misaligned pixels and error is high.
+
+It requires no labels, no ground truth, no additional hardware. Just the two images and the math.
+
+```text
+error = mean( |original - warp(ai_view, disparity)| )
+         over all valid disparity pixels
+         measured in gray levels (0–255 scale)
+```
+
+- Below 12 gray levels: calibrated stereo range.
+- Below 25: acceptable uncalibrated stereo.
+- Above 25: stereo signal is unreliable — defer to DA3.
+
+## The Outputs
+
+- `final_depth.png` — TURBO colormap visualization
+- `overlay.png` — depth blended 50/50 on original wound photograph
+- `interactive_heatmap.html` — hover over any pixel to see depth value and tissue classification
+- `interactive_3d_topology.html` — rotate and zoom wound surface topology in 3D
+
+## Three Things Yet to Solve
+
+**Automated wound cropping.** We tried SAM, OpenCV masking, saliency-based detection. None matched manual cropping quality on close-up clinical photography with specular highlights and color overlap between wound and peri-wound tissue. Manual crop widget in the interface for now. A wound-specific segmentation model is the production path.
+
+**Real-time AI viewpoint generation.** Gemini API requires billing. We pre-generated 57 viewpoints for the evaluation dataset. Runtime generation is architecturally supported — it is a cost constraint, not a technical one.
+
+**Metric depth.** The system produces relative depth normalized to `[0,1]`. Not millimeters. A reference object in the photograph — a standard wound ruler — would calibrate relative to metric units in one additional step. That is the next engineering milestone.
+
+## What This Could Become
+
+The wound assessment use case was our domain of choice. The architecture is not wound-specific.
+
+Any domain where 3D surface information matters, where the current workflow already includes photography, and where dedicated 3D hardware is too expensive or impractical — burns assessment, pressure ulcer staging, dermatology lesion profiling, surgical site monitoring, industrial surface inspection — the same approach applies.
+
+The photograph that already exists in the workflow becomes the measurement tool. That is the idea worth carrying forward.
+
+Written by Ibtesam Hussain — FAST-NUCES Karachi, FYP 2025–2026
