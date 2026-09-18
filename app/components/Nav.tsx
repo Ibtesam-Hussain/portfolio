@@ -1,17 +1,21 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import { usePathname } from 'next/navigation';
 
 const navItems = [
-  { name: 'Work', href: '#work' },
-  { name: 'Experience', href: '#experience' },
-  { name: 'Notes', href: '#notes' },
-  { name: 'Contact', href: '#contact' },
+  { name: 'Work', href: '#work', fullPath: '/#work' },
+  { name: 'Experience', href: '#experience', fullPath: '/#experience' },
+  { name: 'Notes', href: '#notes', fullPath: '/#notes' },
+  { name: 'Resume', href: '/resume', fullPath: '/resume' },
+  { name: 'Contact', href: '#contact', fullPath: '/#contact' },
 ];
 
 export default function Nav() {
+  const pathname = usePathname();
   const [activeSection, setActiveSection] = useState('');
   const [isOpen, setIsOpen] = useState(false);
+  const isResumePage = pathname === '/resume';
 
   useEffect(() => {
     const handleScroll = () => {
@@ -47,7 +51,7 @@ export default function Nav() {
     <nav className="sticky top-0 z-50 border-b border-line bg-paper/95 backdrop-blur-sm">
       <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
         {/* Logo/Initials */}
-        <a href="#hero" className="text-2xl font-bold text-ink hover:text-signal transition-colors">
+        <a href={isResumePage ? '/' : '#hero'} className="text-2xl font-bold text-ink hover:text-signal transition-colors">
           Ibtesam Hussain
         </a>
 
@@ -59,7 +63,7 @@ export default function Nav() {
             return (
               <a
                 key={item.name}
-                href={item.href}
+                href={isResumePage ? item.fullPath : item.href}
                 className={`relative text-sm font-medium transition-colors group ${
                   isActive
                     ? 'text-signal'
@@ -113,7 +117,7 @@ export default function Nav() {
             return (
               <a
                 key={item.name}
-                href={item.href}
+                href={isResumePage ? item.fullPath : item.href}
                 className={`block text-sm font-medium transition-colors ${
                   isActive
                     ? 'text-signal'
