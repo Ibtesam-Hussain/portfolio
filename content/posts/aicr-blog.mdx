@@ -1,0 +1,105 @@
+---
+title: "I Fine-Tuned an LLM to Review Code — Then Spent Next 48 Hours Debugging Why It Wasn't Actually Fine-Tuned LOL"
+excerpt: "Building AICR: a QLoRA + SFT + DPO pipeline for reviewing AI-generated code, and the two silent bugs that made it look broken."
+date: "03-09-2026"
+tags: ["fine-tuning", "llm", "dpo", "sft", "lora", "qlora"]
+---
+
+## The idea
+
+Copilot, Cursor, Claude, and GPT are writing more and more production code these days. But AI-generated code has a particular failure signature — confident, well-formatted, and *subtly* wrong. So I set out to fine-tune a small LLM specifically to review that code: validate what's reasonable, then flag the real issues, grounded in actual test evidence instead of vibes.
+
+That project became **AICR** — and it taught me more about the mechanics of fine-tuning than any tutorial could have, mostly because almost nothing worked on the first try.
+
+> Full code, dataset, and results: [github.com/Ibtesam-Hussain/AICR](https://github.com/Ibtesam-Hussain/AICR)
+
+## Building the dataset, properly
+
+I didn't want synthetic toy bugs. So I wrote 30 casual, underspecified coding tasks — the way a developer actually prompts an AI tool — and ran each one through **Claude, GPT, and Cursor**. That gave me 90 real, independently-generated snippets.
+
+Then, instead of eyeballing them for bugs, I wrote a shared test suite per task and ran all 90 snippets through it in an isolated environment. No opinions — just pass/fail against the original requirement.
+
+A few things fell out of that testing that I didn't expect:
+
+- All three tools made the **exact same mistake** on a timezone conversion task (`pytz.timezone('UTC')` instead of `pytz.UTC`) — a hard crash on the *normal* case, not even an edge case.
+- Claude and GPT both mishandled version-string comparisons like `"1.2"` vs `"1.2.0"`. Cursor got it right.
+
+From there I tiered the results — distinct bugs, repetitive `None`-handling failures, and clean passes — so the model wouldn't just learn "always check for `None`" and call it a day. That gave me **111 chosen/rejected preference pairs** to train on.
+
+## Attempt one: it "worked," but didn't
+
+I fine-tuned `Qwen2.5-Coder-3B-Instruct` with QLoRA. Loss went down nicely. I ran inference on held-out examples.
+
+The output was... a generic Wikipedia-style code walkthrough. Headers, bullet points, a polite "Potential Improvements" section at the end. No validation, no grounded critique, nothing resembling what I trained it on.
+
+My first instinct was *more training*. I bumped epochs from 3 to 8. Loss dropped beautifully — all the way to 0.07. Then I checked a few checkpoints along the way.
+
+They were **identical**. Checkpoint 24, checkpoint 48, checkpoint 96 — same output, word for word, on the same input.
+
+> If eight epochs of additional training produce byte-for-byte identical text, something upstream is lying to you.
+
+## The two bugs hiding underneath
+
+Two separate, silent problems were compounding:
+
+**1. A chat template mismatch.** Training used `add_generation_prompt=False`; inference used `True`. The model had been trained on a prompt *shape* it never actually saw at generation time.
+
+**2. A PEFT variable-reuse bug.** My inference cells were reattaching the adapter to a `model` variable that was already PEFT-wrapped from an earlier training cell. Classic notebook contamination — wrapping an already-wrapped model doesn't do what you'd assume.
+
+The moment I isolated a **fresh base model** and explicitly compared adapter-enabled vs. adapter-disabled generation side by side, the fog cleared:
+
+```
+Generation WITH adapter active:    "...crashes with a TypeError... consider adding type checking..."
+Generation WITH adapter DISABLED:  "1. Function Definition... 2. Return Statement... 3. Syntax..."
+Are the two outputs identical? → False
+```
+
+Finally, real signal.
+
+## The illusion of "it's working"
+
+There was one more trap. Adding a system prompt at inference time pushed structure-adherence up to 70–80%. Great news — except I hadn't tested the one control that mattered: **does the base model, with zero fine-tuning, do the same thing given the same system prompt?**
+
+It did. Nearly identically.
+
+That result humbled me a bit. The fine-tuning wasn't contributing anything — the system prompt was doing all the work. It's a reminder that a good result without a control test isn't evidence, it's a guess that happened to look nice.
+
+## SFT vs. DPO — what actually moved the needle
+
+Once the pipeline bugs were fixed, the real comparison got interesting.
+
+**Base → SFT:** a large, honest jump. Grounding accuracy on held-out code went from *0.07 → 0.82*. This is where fine-tuning earned its keep.
+
+**SFT → DPO:** barely moved. Looking at the raw DPO training metrics explained why — `rewards/chosen` barely shifted (+0.04) while `rewards/rejected` collapsed (−2.72). DPO had mostly taught the model what to *avoid*, not what to do *better*. At ~110 preference pairs, there just wasn't enough signal to push past what SFT had already achieved.
+
+I also trained two lineages — one with a system instruction baked into every training example, one without. The difference showed up in exactly one place: hallucination on clean, bug-free code.
+
+- **With system prompt trained in:** correctly said "no issues found."
+- **Without it:** confidently invented a fake bug, complete with a fabricated test case, on code that had "None" error.
+
+DPO didn't fix that gap in either direction. The SFT starting point mattered more than the alignment stage on top of it.
+
+## Shipping it
+
+The final DPO adapter is on the [Hugging Face Hub](https://huggingface.co/ibti101/aicr-v1), and I wrapped it in a small pip-installable CLI:
+
+```bash
+pip install -e .
+aicr review my_script.py
+```
+
+No hosted API, no server — it downloads the base model and adapter once, then runs entirely on your own machine.
+
+## What actually stuck with me
+
+The technique — QLoRA, SFT, DPO — is genuinely not the hard part. Anyone can follow a training script. The hard part was:
+
+- Not trusting a decreasing loss curve at face value
+- Running a proper control before believing a "70% success rate"
+- Tracing a silent bug back through checkpoints, variable scope, and chat templates instead of just retraining and hoping
+
+If there's one thing worth taking from this project, it's that **debugging a fine-tune is a different skill than running one** — and it's the one nobody puts in the tutorial.
+
+---
+
+*Full dataset, ground truth, training configs, and evaluation transcripts are in the [AICR repo](https://github.com/Ibtesam-Hussain/AICR).*
