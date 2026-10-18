@@ -1,0 +1,222 @@
+---
+title: "Building JobAgent: Engineering an AI Agent That Finds Jobs for Me"
+excerpt: "The engineering decisions, problems, and trade-offs behind building a self-hosted job monitoring agent with Playwright, SQLite, LLMs, and WhatsApp."
+date: "18-10-2026"
+tags:
+  - Agentic AI
+  - Python
+  - LLM
+  - Web Automation
+  - Open Source
+---
+
+I started building JobAgent around a simple problem: **finding a job is not just about searching for openings; it is also about discovering the right opening before you miss it.**
+When you are targeting specific companies, you cannot rely entirely on general job boards. You may need to visit multiple company career pages, check whether anything new has been posted, read the descriptions, compare them with your skills, and repeat the process the next day.
+I wanted to automate that loop.
+
+The goal was not to build another job board or a chatbot that recommends careers. I wanted a personal agent that could monitor selected company career pages, evaluate new opportunities against configurable preferences, remember what it had already processed, and notify me through WhatsApp when it found a relevant role.
+That project became [JobAgent](https://github.com/Ibtesam-Hussain/Job-Agent-Alerter), an open-source, self-hosted job monitoring system.
+
+The interesting part was not simply connecting a scraper to an LLM. It was figuring out how to make the entire workflow useful, repeatable, and reasonably cost-efficient.
+
+## The first design challenge: collecting jobs reliably
+
+My first challenge was getting job listings from company career pages in a form that the rest of the system could understand.
+Career portals do not all behave the same way. Some render their content dynamically with JavaScript, and the HTML available before the page finishes rendering may not contain the actual job listings.
+A basic HTTP request followed by HTML parsing can work for some pages, but it is not a dependable general solution for JavaScript-heavy portals.
+
+### Why I chose Playwright
+
+I used Playwright to automate the browser and access dynamically rendered career pages. Once the relevant page content was available, BeautifulSoup helped me parse the HTML and extract useful information.
+
+The scraping and extraction stages were kept separate from the AI decision stage:
+
+- **Playwright** handles browser automation and page rendering.
+- **BeautifulSoup** helps parse the resulting HTML.
+- **Job extraction logic** converts page content into structured job details.
+- **The decision engine** evaluates those structured records later in the pipeline.
+
+This separation mattered because scraping and deciding whether a job is relevant are two different problems. I wanted to be able to improve the extraction logic without redesigning the LLM evaluation process.
+I also kept the monitored career pages configurable through target URLs rather than treating one company as the only possible source.
+
+**Engineering lesson:** A job-monitoring agent is only as useful as the data it collects. Before introducing AI, I needed a reasonably reliable way to turn inconsistent web pages into structured records.
+
+## The second challenge: not every job deserves an LLM call
+
+Once I could collect job listings, I faced another problem: a career page might contain positions that have little or nothing to do with a user's target roles.
+Sending every listing to an LLM would be wasteful. It could increase latency and API usage while spending resources evaluating obviously irrelevant positions.
+I considered the pipeline as a sequence of increasingly selective stages rather than asking the LLM to do everything.
+
+### Filtering before reasoning
+
+I added a lightweight keyword-based filter for job titles before extracting and evaluating candidates with the LLM.
+For example, if someone configures the agent to target software and QA roles, the preliminary filter can remove many unrelated listings before they reach the more expensive decision stage.
+The important design choice was to use this filter as a **preliminary screening step**, not as the final relevance decision.
+Keyword matching is fast, but it cannot fully understand context. A job title might use unfamiliar terminology, while a seemingly relevant title might describe a role that does not match the candidate's experience.
+That is where the LLM becomes useful.
+
+The resulting approach was:
+
+1. Collect the available job listings.
+2. Remove obvious non-target roles with a lightweight filter.
+3. Extract structured job details.
+4. Check which records are new.
+5. Use the LLM to evaluate the remaining candidates against the user's preferences.
+
+This gave each stage a specific responsibility instead of making the LLM responsible for every decision.
+
+## The third challenge: remembering what the agent has already seen
+
+A scraper can successfully retrieve the same job every time it visits a career page. But from the user's perspective, repeatedly receiving the same alert is a failure.
+I needed JobAgent to distinguish between discovering a listing and discovering a *new* listing.
+I also wanted to avoid asking the LLM to evaluate the same jobs on every run.
+
+### Designing persistent memory with SQLite
+
+I used SQLite to persist job records across pipeline executions. The database layer tracks scraped jobs and selected jobs, allowing the pipeline to identify new candidates and maintain the notification workflow.
+The deduplication logic uses job identifiers such as the application URL, title, and company to help recognize previously encountered listings.
+The processing flow became incremental:
+
+- Newly scraped records are inserted into persistent storage.
+- Existing records are checked rather than blindly treated as new.
+- Only unseen jobs are passed to the LLM decision stage.
+- Selected jobs are persisted for the notification stage.
+
+This is a small architectural decision with a meaningful effect. Without persistent state, each execution would behave like a fresh search. With it, JobAgent can build on what happened during earlier runs.
+It also means the database is more than a place to store results. It is part of the agent's operational memory.
+
+### Why SQLite?
+
+For a personal, self-hosted application, SQLite was a practical choice. It does not require a separate database server, and it keeps the initial setup relatively simple.
+I did not need a distributed database architecture just to monitor a handful of selected career pages.
+There are still details worth considering as the project evolves, such as how to recover from interrupted runs and how to handle a notification that fails after a job has already been selected. Those are important reliability concerns for any workflow that combines persistent state with external services.
+
+## The fourth challenge: making the LLM useful rather than just adding AI
+
+At this point, JobAgent could collect, filter, and remember listings. But keyword matching alone could not answer the question I actually cared about:
+**Is this job a good match for the preferences I configured?**
+A title can look relevant while the responsibilities, required skills, seniority, or work arrangement make the position unsuitable.
+I therefore used an LLM through OpenRouter to evaluate new job candidates against user-defined preferences.
+
+### Moving preferences out of the code
+
+I wanted the agent to be configurable for different job searches without requiring changes to its core logic.
+The configuration includes preferences such as:
+
+- Target roles
+- Technical skills
+- Experience level
+- Work mode
+- Location
+- Target companies
+
+The decision engine receives the new job records alongside these preferences and produces a selection decision, match score, and explanation.
+That explanation matters. A score alone tells the user how strongly the model rated a job, but not why it considered the role relevant.
+For example, a notification might explain that a role aligns with Python, Selenium, and API testing. That is more useful than simply receiving a job title and a number.
+
+### The lesson from model behavior
+
+One issue I encountered while experimenting with job evaluation was that an LLM could recommend a senior role even when the configured experience level did not support that recommendation.
+This highlighted an important limitation: a model can interpret preferences imperfectly, even when those preferences are explicitly provided.
+
+I learned not to treat the LLM's score as ground truth. Seniority, location, and other hard constraints may need explicit validation or deterministic rules rather than relying entirely on a prompt.
+That distinction is central to how I think about AI engineering: use the model where contextual reasoning adds value, but do not assume that prompting alone guarantees correct decisions.
+
+## The fifth challenge: free APIs are not always dependable
+
+I wanted to keep JobAgent accessible for personal use, so I experimented with free-tier LLM models through OpenRouter.
+The trade-off became apparent when the selected free model was intermittently rate-limited or unavailable.
+A workflow that depends on an external model cannot assume every request will succeed. Even if the scraping and database stages work correctly, an unavailable model can interrupt the decision stage.
+This influenced how I thought about cost and reliability.
+The keyword filter reduces the number of listings sent for evaluation, and persistent state avoids repeatedly evaluating previously processed jobs. Both decisions help limit unnecessary API calls.
+
+However, fewer requests do not solve provider availability by themselves. Model selection, error handling, and retry behavior remain separate reliability concerns.
+I would rather make those limitations explicit than describe a free-tier dependency as production-reliable simply because it works during a successful test.
+
+## The final mile: turning a match into a useful alert
+
+A relevant job sitting in a database is not enough. The point of automating discovery is to make the result actionable without requiring the user to keep checking the application.
+I integrated Twilio's WhatsApp messaging capability so that selected jobs could be delivered directly to the user's phone.
+The alert includes the job title, company, match score, a short explanation, and an application link.
+
+### Debugging the notification integration
+
+Integrating a messaging service introduced its own configuration requirements. During testing, I encountered a sender configuration mismatch that prevented the expected message from being delivered.
+The issue was not with job relevance or scraping. It was in the connection between the application and the external messaging service.
+That distinction made the debugging process important: a failed notification does not necessarily mean the entire pipeline failed.
+I also learned that Twilio's WhatsApp Sandbox has its own setup requirements. A test recipient may need to join the sandbox, and the sandbox is not equivalent to having a production WhatsApp sender configured.
+For a personal project, the sandbox was a useful way to validate the notification flow without immediately building a production messaging setup.
+It also reinforced a broader lesson: external integrations introduce operational requirements that are easy to overlook when designing only the happy path.
+
+## Bringing the stages together
+
+Once the individual components were in place, I organized them behind `main.py`, which acts as the entry point and orchestrates a pipeline cycle.
+At a high level, the workflow looks like this:
+
+![job agent project system architecture](/job-agent-arch.png)
+
+The pipeline also records counts at different stages, including scraped listings, filtered jobs, extracted records, new jobs, selected jobs, and alert outcomes.
+I found this useful because it makes the system easier to reason about when something goes wrong.
+If the scraper returns no listings, I need to investigate a different part of the system than I would if listings were extracted correctly but no jobs were selected. Similarly, a selected job with a failed alert points toward the notification path rather than the relevance filter.
+Structured logging and stage-level summaries make these differences easier to diagnose.
+The result is a pipeline where each component has a defined responsibility, and the main entry point coordinates the flow.
+
+## Why I kept JobAgent self-hosted
+
+I deliberately approached JobAgent as a personal, open-source tool rather than a multi-user SaaS product.
+A hosted service would introduce additional requirements: user accounts, multi-tenant data isolation, hosted persistence, service monitoring, and a deployment model that supports multiple users.
+Those are valid requirements for a different product, but they were not necessary to solve my original problem.
+
+For this version, I prioritized:
+
+- Configurable personal preferences
+- A local persistent database
+- Automated monitoring of selected career pages
+- LLM-based relevance decisions
+- WhatsApp notifications
+- A straightforward Python entry point
+
+The architecture is intentionally smaller than a production SaaS platform. It can be run locally and scheduled, while cloud deployment remains an option.
+Keeping the scope focused allowed me to spend more time on the actual problem: identifying new opportunities and making the results useful.
+
+## What I learned from building it
+
+JobAgent taught me that building an AI agent is not simply a matter of connecting an LLM to a tool.
+The surrounding engineering decisions often determine whether the system is useful.
+
+**First, deterministic logic still matters.** The LLM adds contextual reasoning, but scraping, preliminary filtering, deduplication, configuration, and database operations provide the structure around that reasoning.
+
+**Second, persistent state changes the nature of the workflow.** A repeated scraper becomes much more useful when it remembers previous discoveries and can focus on incremental updates.
+
+**Third, AI decisions need boundaries.** A model can misunderstand seniority or other preferences, so important constraints may need explicit validation.
+
+**Fourth, external services create failure modes of their own.** API rate limits, credentials, sender configuration, and sandbox requirements are part of the engineering problem, not merely setup details.
+
+**Finally, observability should be designed into the workflow.** Stage-level counts and logs help explain what happened during a run instead of leaving the developer to guess.
+
+These lessons apply well beyond job monitoring. Any agent that observes external data, makes decisions, maintains state, and takes action needs to handle the same fundamental concerns.
+
+## What's next?
+
+I see several possible directions for improving JobAgent:
+
+- Stronger seniority and hard-constraint validation.
+- More robust handling of model errors and interrupted pipeline runs.
+- Additional notification channels, such as email or Telegram.
+- Better matching between complete job descriptions and a candidate's skills.
+- More detailed history and analytics for previously selected jobs.
+- Feedback mechanisms that help improve relevance decisions over time.
+
+These are potential improvements, not claims that every feature is already implemented.
+The most important next step is to evaluate the system against real job listings: how often it surfaces genuinely relevant roles, how many relevant opportunities it misses, and how reliably it delivers alerts.
+
+## Final thoughts
+
+JobAgent started with a repetitive task: checking company career pages for openings that might be relevant to me.
+Building it pushed me to think beyond scraping and prompting. I had to consider data extraction, filtering strategy, persistent memory, model behavior, API limitations, notifications, and debugging the complete workflow.
+That is what made the project valuable to me as an AI engineer. It gave me an opportunity to work on the system around the model—not just the model call itself.
+If you are interested in the implementation, you can explore the source code, try the project, or contribute here:
+
+**[GitHub — JobAgent](https://github.com/Ibtesam-Hussain/Job-Agent-Alerter)**
+
+The idea is simple: discover new jobs, evaluate them against your preferences, and notify you when there is a reason to take a closer look.
