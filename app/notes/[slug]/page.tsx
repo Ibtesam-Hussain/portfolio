@@ -80,11 +80,11 @@ export default async function NotePage({ params }: Props) {
                   {children}
                 </blockquote>
               ),   
-              pre: ({ children }) => {
+              pre: ({ children }) => (
                   <pre className="mb-6 overflow-x-auto rounded-md bg-ink p-5 font-mono text-sm leading-relaxed text-paper">
                     {children}
                   </pre>
-              },
+              ),
               code: ({ children, className }) => (
                 <code className={className ?? 'rounded bg-paper-dim px-1 py-0.5 text-sm text-ink'}>
                   {children}
